@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 """
-Prospection Mandats - Application Streamlit
+Prospection Mandats - Application Streamlit (VERSION CORRIGÉE)
 Gratuit | En ligne | Sans installation locale
 Gironde (33)
+
+FIXES:
+- Suppression du problème folium/streamlit-folium
+- Utilisation de pydeck pour la carte (plus stable)
+- Compatibilité garantie avec Streamlit Cloud
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-import folium
-from streamlit_folium import st_folium
 from difflib import SequenceMatcher
 import io
+import pydeck as pdk
 
 # ============================================================================
 # CONFIG STREAMLIT
@@ -57,7 +61,6 @@ class ProspectMatcher:
             st.error("❌ Votre Excel doit avoir une colonne 'adresse'")
             return False
         
-        # Normaliser colonne adresse (flexible)
         addr_col = [col for col in self.crm_data.columns if 'adress' in col.lower()]
         if addr_col:
             self.crm_data['address_normalized'] = self.crm_data[addr_col[0]].apply(
@@ -66,7 +69,7 @@ class ProspectMatcher:
         return True
     
     def create_demo_data(self):
-        """Données de démo Gironde"""
+        """Données de démo Gironde avec coordonnées"""
         self.dvf_data = pd.DataFrame({
             'l_adr': [
                 '123 Rue de la Paix, Bordeaux',
@@ -82,7 +85,9 @@ class ProspectMatcher:
             'l_com': ['Bordeaux', 'Talence', 'Arcachon', 'Bordeaux', 'Bruges', 'Pauillac', 'Arcachon', 'Bordeaux'],
             'valeur_fonciere': [350000, 280000, 450000, 320000, 290000, 380000, 520000, 410000],
             'surface_reelle_bati': [95, 78, 120, 85, 110, 105, 135, 100],
-            'date_mutation': ['2024-01-15', '2024-02-20', '2024-03-10', '2024-04-05', '2024-03-25', '2024-02-10', '2024-03-15', '2024-04-01']
+            'date_mutation': ['2024-01-15', '2024-02-20', '2024-03-10', '2024-04-05', '2024-03-25', '2024-02-10', '2024-03-15', '2024-04-01'],
+            'latitude': [44.8378, 44.7945, 44.6678, 44.8384, 44.9012, 45.1894, 44.6678, 44.8410],
+            'longitude': [-0.5792, -0.6145, -1.1682, -0.5730, -0.3234, -0.7414, -1.1682, -0.5680]
         })
         self.dvf_data['address_normalized'] = self.dvf_data['l_adr'].apply(self._normalize_address)
         
@@ -105,7 +110,6 @@ class ProspectMatcher:
                 sim = self._similarity_score(dvf_addr, dpe_addr)
                 
                 if sim >= threshold:
-                    # Vérifier si dans CRM
                     in_crm = False
                     if self.crm_data is not None:
                         for _, crm_row in self.crm_data.iterrows():
@@ -124,7 +128,9 @@ class ProspectMatcher:
                             'date_mutation': dvf_row.get('date_mutation', 'N/A'),
                             'dpe_classe': dpe_row.get('classe_consommation_energie', 'N/A'),
                             'dpe_date': dpe_row.get('date_etablissement_dpe', 'N/A'),
-                            'similarity': round(sim, 2)
+                            'similarity': round(sim, 2),
+                            'latitude': dvf_row.get('latitude', 44.84),
+                            'longitude': dvf_row.get('longitude', -0.58)
                         })
         
         self.opportunities = pd.DataFrame(matches)
@@ -138,17 +144,14 @@ class ProspectMatcher:
         opp = self.opportunities.copy()
         opp['score'] = 0
         
-        # DPE mauvaise classe
         dpe_points = {'G': 25, 'F': 20, 'E': 15, 'D': 10, 'C': 5, 'B': 2, 'A': 0}
         for classe, pts in dpe_points.items():
             opp.loc[opp['dpe_classe'] == classe, 'score'] += pts
         
-        # DPE récent
         opp['dpe_date'] = pd.to_datetime(opp['dpe_date'], errors='coerce')
         recent = datetime.now() - timedelta(days=180)
         opp.loc[opp['dpe_date'] > recent, 'score'] += 10
         
-        # Prix élevé
         try:
             price_90 = opp['prix_vente'].quantile(0.90)
             price_75 = opp['prix_vente'].quantile(0.75)
@@ -157,10 +160,7 @@ class ProspectMatcher:
         except:
             pass
         
-        # Surface
         opp.loc[(opp['surface'] > 80) & (opp['surface'] < 300), 'score'] += 10
-        
-        # Similarité adresse
         opp.loc[opp['similarity'] >= 95, 'score'] += 5
         
         opp['score'] = opp['score'].clip(upper=100)
@@ -239,7 +239,7 @@ matcher = ProspectMatcher()
 
 if mode == "📊 Données de démo (test)":
     matcher.create_demo_data()
-    matcher.crm_data = None  # Pas de CRM en démo
+    matcher.crm_data = None
     st.success("✅ Données de démo chargées (Gironde)")
 else:
     uploaded_file = st.file_uploader(
@@ -252,7 +252,7 @@ else:
         try:
             crm_df = pd.read_excel(uploaded_file)
             if matcher.load_crm(crm_df):
-                matcher.create_demo_data()  # Charger DVF/DPE démo même avec CRM custom
+                matcher.create_demo_data()
                 st.success(f"✅ CRM chargé ({len(crm_df)} mandats)")
         except Exception as e:
             st.error(f"❌ Erreur lecture Excel: {str(e)}")
@@ -358,66 +358,62 @@ if matcher.dvf_data is not None:
             st.warning("❌ Aucune opportunité ne correspond à vos filtres")
     
     # ====================================================================
-    # TAB 2 : CARTE
+    # TAB 2 : CARTE AVEC PYDECK (compatible Streamlit)
     # ====================================================================
     
     with tab2:
         if len(filtered) > 0:
-            # Coordonnées Gironde
-            coords = {
-                'Bordeaux': (44.8378, -0.5792),
-                'Talence': (44.7945, -0.6145),
-                'Arcachon': (44.6678, -1.1682),
-                'Bruges': (44.9012, -0.3234),
-                'Pauillac': (45.1894, -0.7414),
-            }
+            # Préparer données pour la carte
+            map_data = filtered[[
+                'latitude', 'longitude', 'adresse', 'commune', 
+                'score', 'dpe_classe', 'prix_vente'
+            ]].copy()
+            map_data.columns = ['lat', 'lon', 'adresse', 'commune', 'score', 'dpe', 'prix']
             
-            # Créer map
-            m = folium.Map(
-                location=[44.84, -0.58],
-                zoom_start=9,
-                tiles='OpenStreetMap'
+            # Couleur par score
+            def get_color(score):
+                if score >= 80:
+                    return [0, 200, 100, 200]  # Vert
+                elif score >= 60:
+                    return [255, 165, 0, 200]  # Orange
+                else:
+                    return [255, 0, 0, 200]  # Rouge
+            
+            map_data['color'] = map_data['score'].apply(get_color)
+            
+            # Créer la couche de points
+            layer = pdk.Layer(
+                'ScatterplotLayer',
+                data=map_data,
+                get_position=['lon', 'lat'],
+                get_color='color',
+                get_radius=800,
+                pickable=True,
             )
             
-            # Ajouter markers
-            for _, row in filtered.iterrows():
-                score = row['score']
-                commune = row['commune']
-                
-                # Couleur par score
-                if score >= 80:
-                    color = 'green'
-                    icon = '🟢'
-                elif score >= 60:
-                    color = 'orange'
-                    icon = '🟠'
-                else:
-                    color = 'red'
-                    icon = '🔴'
-                
-                # Coordonnées
-                lat, lng = coords.get(commune, (44.84, -0.58))
-                
-                popup_text = f"""
-                <b>{row['adresse']}</b><br>
-                Score: {score:.0f}/100<br>
-                Prix: €{row['prix_vente']:,.0f}<br>
-                DPE: {row['dpe_classe']}<br>
-                Surface: {row['surface']}m²
-                """
-                
-                folium.CircleMarker(
-                    location=[lat, lng],
-                    radius=12,
-                    popup=popup_text,
-                    color=color,
-                    fill=True,
-                    fillColor=color,
-                    fillOpacity=0.7,
-                    weight=2
-                ).add_to(m)
+            # Vue initiale
+            view_state = pdk.ViewState(
+                latitude=44.84,
+                longitude=-0.58,
+                zoom=9,
+                bearing=0,
+                pitch=0
+            )
             
-            st_folium(m, width=700, height=500)
+            # Créer la carte
+            st.pydeck_chart(
+                pdk.Deck(
+                    layers=[layer],
+                    initial_view_state=view_state,
+                    tooltip={
+                        'html': '<b>Adresse:</b> {adresse}<br><b>Score:</b> {score}<br><b>DPE:</b> {dpe}<br><b>Prix:</b> €{prix:,.0f}',
+                        'style': {'backgroundColor': 'steelblue', 'color': 'white'}
+                    }
+                )
+            )
+            
+            st.info("💡 **Astuce:** Cliquez sur les points pour voir les détails")
+            st.success(f"✅ {len(filtered)} biens affichés sur la carte")
         else:
             st.warning("❌ Pas de biens à afficher sur la carte")
     
@@ -476,7 +472,7 @@ st.divider()
 st.markdown("""
 <center>
     <small>
-    🚀 Prospection Intelligente v1.0 | Gironde (33) | Gratuit
+    🚀 Prospection Intelligente v2.0 (CORRIGÉE) | Gironde (33) | Gratuit
     </small>
 </center>
 """, unsafe_allow_html=True)
